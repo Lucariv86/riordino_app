@@ -1,11 +1,19 @@
 import io
+from datetime import datetime
+
 import streamlit as st
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 from reorder_engine import (
     ReorderConfig,
     parse_input_excel_fixed_columns,
     compute_reorders,
     export_to_excel,
+    build_order_csv_bytes,
 )
 
 st.set_page_config(page_title="Riordini Magazzino", layout="wide")
@@ -23,6 +31,9 @@ with col2:
     target_value = st.number_input("Target valore ordine (€) - opzionale", min_value=0.0, value=0.0, step=100.0)
 with col3:
     three_dec_style = st.checkbox('Giacenza stile "-1,000" = -1', value=True)
+
+generate_cosso_csv = st.checkbox("Genera CSV ordine Cosso (BLU/COR/UNI)", value=True)
+generate_aspl_csv = st.checkbox("Genera CSV ordine ASPL", value=True)
 
 run = st.button("Calcola riordino", type="primary")
 
@@ -80,3 +91,40 @@ if run:
         file_name="riordino_output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+    now = datetime.now()
+    if ZoneInfo is not None:
+        try:
+            now = datetime.now(ZoneInfo("Europe/Rome"))
+        except Exception:
+            now = datetime.now()
+
+    if generate_cosso_csv:
+        cosso_csv_bytes = build_order_csv_bytes(
+            df_riordino=df_riordino,
+            brands=["BLU", "COR", "UNI"],
+            code_col="CODICE ARTICOLO",
+            qty_col="qty_to_order",
+        )
+        cosso_filename = f"ordine_cosso_{now.strftime('%Y%m%d')}.csv"
+        st.download_button(
+            label="Scarica CSV ordine Cosso",
+            data=cosso_csv_bytes,
+            file_name=cosso_filename,
+            mime="text/csv",
+        )
+
+    if generate_aspl_csv:
+        aspl_csv_bytes = build_order_csv_bytes(
+            df_riordino=df_riordino,
+            brands=["ASPL"],
+            code_col="CODICE ARTICOLO",
+            qty_col="qty_to_order",
+        )
+        aspl_filename = f"ordine_ASPL_{now.strftime('%Y%m%d_%H%M%S')}.csv"
+        st.download_button(
+            label="Scarica CSV ordine ASPL",
+            data=aspl_csv_bytes,
+            file_name=aspl_filename,
+            mime="text/csv",
+        )
