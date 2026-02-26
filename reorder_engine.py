@@ -8,6 +8,36 @@ import numpy as np
 import pandas as pd
 
 
+def build_order_csv_bytes(
+    df_riordino: pd.DataFrame,
+    brands: List[str],
+    code_col: str,
+    qty_col: str = "qty_to_order",
+) -> bytes:
+    """Build order CSV bytes with format CODICE;QUANTITA encoded in UTF-8."""
+    normalized_brands = {str(brand).strip().upper() for brand in brands}
+
+    brand_series = (
+        df_riordino.get("MARCA", pd.Series("", index=df_riordino.index))
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    qty_series = pd.to_numeric(df_riordino.get(qty_col, 0), errors="coerce").fillna(0)
+
+    selected = df_riordino.loc[
+        brand_series.isin(normalized_brands) & (qty_series > 0),
+        [code_col, qty_col],
+    ].copy()
+
+    selected = selected.rename(columns={code_col: "CODICE", qty_col: "QUANTITA"})
+    selected["CODICE"] = selected["CODICE"].astype(str)
+    selected["QUANTITA"] = pd.to_numeric(selected["QUANTITA"], errors="coerce").fillna(0).astype(int)
+
+    return selected.to_csv(index=False, sep=";", encoding="utf-8").encode("utf-8")
+
+
 @dataclass
 class ReorderConfig:
     coverage_days: int = 30
