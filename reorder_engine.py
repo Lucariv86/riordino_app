@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 
@@ -241,7 +242,7 @@ def compute_reorders(df: pd.DataFrame, config: ReorderConfig):
     # GIACENZA
     # ===============================
     out["giacenza_input"] = out[giacenza].fillna(0.0)
-    out["giacenza_effettiva"] = out["giacenza_input"].apply(lambda x: max(float(x), 0.0))
+    out["giacenza_effettiva"] = out["giacenza_input"].clip(lower=0.0)
 
     # ===============================
     # STOCK TARGET
@@ -253,9 +254,11 @@ def compute_reorders(df: pd.DataFrame, config: ReorderConfig):
     out["needed_float"] = out["stock_target"] - out["giacenza_effettiva"]
 
     # Non ordinare se < 1 pezzo
-    out["qty_to_order"] = out["needed_float"].apply(
-        lambda x: int(math.ceil(x)) if x >= 1 else 0
-    )
+    out["qty_to_order"] = np.where(
+        out["needed_float"] >= 1,
+        np.ceil(out["needed_float"]),
+        0,
+    ).astype(int)
 
     # ===============================
     # REGOLE COSTO
@@ -299,15 +302,12 @@ def compute_reorders(df: pd.DataFrame, config: ReorderConfig):
     # VALORE RIGA
     # ===============================
     out["valore_riga"] = out["qty_to_order"] * out["costo_unitario"]
-        # ===============================
-        # ===============================
+
     # TARGET VALORE ORDINE (€) - FAST
     # ===============================
     if config.target_value_eur is not None and float(config.target_value_eur) > 0:
         target = float(config.target_value_eur)
 
-        # Totale base
-        out["valore_riga"] = out["qty_to_order"] * out["costo_unitario"]
         total_value = float(out["valore_riga"].sum())
 
         if total_value < target:
@@ -328,82 +328,102 @@ def compute_reorders(df: pd.DataFrame, config: ReorderConfig):
 
             # extra pezzi possibili senza superare 180gg
             max_extra_180 = (max_stock_180 - stock_now).clip(lower=0.0).fillna(0.0)
-            max_extra_180_int = max_extra_180.apply(lambda x: int(math.floor(x)))  # una sola passata
+            max_extra_180_int = np.floor(max_extra_180).astype(int)
 
-            # priorità veloce (vettoriale): domanda alta + sotto copertura + economici
-            # sotto copertura attuale (rispetto coverage_days scelti)
-            under_cov = ((dd > 0) & ((stock_now / dd) < float(config.coverage_days))).astype(float)
-
-            priority = (
-                under_cov * 1_000_000
-                + dd * 100_000
-                + cheap.astype(float) * 100
-            )
+            # priorità: sotto copertura -> alta domanda -> costo economico
+            coverage_now = np.where(dd > 0, stock_now / dd, np.inf)
+            under_cov = (dd > 0) & (coverage_now < float(config.coverage_days))
 
             # candidati: escludi gonfiaggi su costosi lenti, cost=0 o dd=0
             candidates_mask = (~low_moves_expensive) & (cost > 0) & ((dd > 0) | (cheap.astype(bool)))
-            candidates = out.loc[candidates_mask, :].copy()
-            candidates["_priority"] = priority.loc[candidates_mask]
-            candidates["_max_extra_180"] = max_extra_180_int.loc[candidates_mask]
+            candidates = out.loc[candidates_mask, ["qty_to_order", "costo_unitario"]].copy()
 
-            # Prendi solo i migliori N candidati per velocità
-            TOP_N = 600
-            candidates = candidates.sort_values("_priority", ascending=False).head(TOP_N)
+            if not candidates.empty:
+                candidates["_under_cov"] = under_cov[candidates_mask].astype(int)
+                candidates["_daily_demand"] = dd[candidates_mask]
+                candidates["_cheap"] = cheap[candidates_mask].astype(int)
+                candidates["_max_extra_180"] = max_extra_180_int[candidates_mask]
 
-            # PASSO 1: riempi fino a target restando entro 180gg
-            # aggiungo pezzi riga per riga ma su TOP_N (600 max) => veloce
-            for idx, row in candidates.iterrows():
-                if remaining <= 0:
-                    break
-                c = float(row["costo_unitario"] or 0.0)
-                if c <= 0:
-                    continue
+                # priorità: sotto copertura (desc), domanda (desc), economici (desc), costo (asc)
+                candidates = candidates.sort_values(
+                    by=["_under_cov", "_daily_demand", "_cheap", "costo_unitario"],
+                    ascending=[False, False, False, True],
+                )
 
-                max_extra = int(row["_max_extra_180"] or 0)
-                if max_extra <= 0:
-                    continue
+                candidate_idx = candidates.index.to_numpy()
+                candidate_cost = candidates["costo_unitario"].to_numpy(dtype=float)
+                candidate_cap_180 = candidates["_max_extra_180"].to_numpy(dtype=int)
+                qty_updates = np.zeros(len(candidates), dtype=int)
+                reason_180_mask = np.zeros(len(candidates), dtype=bool)
+                reason_over_mask = np.zeros(len(candidates), dtype=bool)
 
-                need_qty = int(math.ceil(remaining / c))
-                add_qty = min(need_qty, max_extra)
-                if add_qty <= 0:
-                    continue
-
-                out.at[idx, "qty_to_order"] = int(out.at[idx, "qty_to_order"]) + add_qty
-                out.at[idx, "motivazione"] = (str(out.at[idx, "motivazione"]) + " + incremento per target € (<=180gg)").strip()
-                out.at[idx, "valore_riga"] = float(out.at[idx, "qty_to_order"]) * float(out.at[idx, "costo_unitario"])
-
-                remaining -= add_qty * c
-
-            # PASSO 2: se ancora sotto, sfora 180gg (sempre su TOP_N) e avvisa
-            if remaining > 0:
-                for idx, row in candidates.iterrows():
+                # PASSO 1: riempi fino a target restando entro 180gg
+                for pos in range(len(candidates)):
                     if remaining <= 0:
                         break
-                    c = float(row["costo_unitario"] or 0.0)
+                    c = candidate_cost[pos]
                     if c <= 0:
                         continue
-
-                    need_qty = int(math.ceil(remaining / c))
-                    if need_qty <= 0:
+                    max_extra = candidate_cap_180[pos]
+                    if max_extra <= 0:
                         continue
+                    need_qty = int(math.ceil(remaining / c))
+                    add_qty = min(need_qty, max_extra)
+                    if add_qty <= 0:
+                        continue
+                    qty_updates[pos] += add_qty
+                    reason_180_mask[pos] = True
+                    remaining -= add_qty * c
 
-                    out.at[idx, "qty_to_order"] = int(out.at[idx, "qty_to_order"]) + need_qty
-                    out.at[idx, "motivazione"] = (str(out.at[idx, "motivazione"]) + " + incremento per target € (sforando 180gg)").strip()
-                    out.at[idx, "valore_riga"] = float(out.at[idx, "qty_to_order"]) * float(out.at[idx, "costo_unitario"])
+                # PASSO 2: se ancora sotto, sfora 180gg e avvisa
+                if remaining > 0:
+                    for pos in range(len(candidates)):
+                        if remaining <= 0:
+                            break
+                        c = candidate_cost[pos]
+                        if c <= 0:
+                            continue
+                        need_qty = int(math.ceil(remaining / c))
+                        if need_qty <= 0:
+                            continue
+                        qty_updates[pos] += need_qty
+                        reason_over_mask[pos] = True
+                        remaining -= need_qty * c
 
-                    remaining -= need_qty * c
+                    warnings.append(
+                        "Target € raggiunto sforando 180 giorni su alcune righe (controlla flag_over_180)."
+                    )
 
-                warnings.append("Target € raggiunto sforando 180 giorni su alcune righe (controlla flag_over_180).")
+                if np.any(qty_updates > 0):
+                    inc_series = pd.Series(qty_updates, index=candidate_idx)
+                    out.loc[candidate_idx, "qty_to_order"] = (
+                        out.loc[candidate_idx, "qty_to_order"].astype(int) + inc_series
+                    )
 
-            # ricalcolo coverage_post e flag_over_180 (vettoriale)
-            dd2 = out["daily_demand"].fillna(0.0)
-            stock2 = out["giacenza_effettiva"].fillna(0.0) + out["qty_to_order"].fillna(0.0)
-            out["coverage_post_ordine"] = None
-            mask_dd = dd2 > 0
-            out.loc[mask_dd, "coverage_post_ordine"] = (stock2[mask_dd] / dd2[mask_dd]).astype(float)
-            out["flag_over_180"] = out["coverage_post_ordine"].apply(
-                lambda x: bool(x is not None and x > config.max_coverage_days)
-            )
+                    reason_180_series = pd.Series(reason_180_mask, index=candidate_idx)
+                    reason_over_series = pd.Series(reason_over_mask, index=candidate_idx)
+
+                    idx_180 = reason_180_series[reason_180_series].index
+                    idx_over = reason_over_series[reason_over_series].index
+
+                    if len(idx_180) > 0:
+                        out.loc[idx_180, "motivazione"] = (
+                            out.loc[idx_180, "motivazione"].astype(str).str.strip()
+                            + " + incremento per target € (<=180gg)"
+                        ).str.strip(" +")
+                    if len(idx_over) > 0:
+                        out.loc[idx_over, "motivazione"] = (
+                            out.loc[idx_over, "motivazione"].astype(str).str.strip()
+                            + " + incremento per target € (sforando 180gg)"
+                        ).str.strip(" +")
+
+                out["valore_riga"] = out["qty_to_order"] * out["costo_unitario"]
+
+    # coverage finale e flag over 180 sempre valorizzati
+    dd2 = out["daily_demand"].fillna(0.0)
+    stock2 = out["giacenza_effettiva"].fillna(0.0) + out["qty_to_order"].fillna(0.0)
+    out["coverage_post_ordine"] = np.where(dd2 > 0, stock2 / dd2, np.nan)
+    out["flag_over_180"] = (out["coverage_post_ordine"] > float(config.max_coverage_days)).fillna(False)
        # ===============================
     # MOTIVO SCARTO + OUTPUTS
     # ===============================
@@ -436,6 +456,8 @@ def compute_reorders(df: pd.DataFrame, config: ReorderConfig):
                      "needed_float",
                      "qty_to_order",
                      "valore_riga",
+                     "coverage_post_ordine",
+                     "flag_over_180",
                      "categoria_regola",
                      "motivazione"]
     riordino_cols = [c for c in riordino_cols if c in riordino.columns]
@@ -450,6 +472,8 @@ def compute_reorders(df: pd.DataFrame, config: ReorderConfig):
                      "stock_target",
                      "needed_float",
                      "qty_to_order",
+                     "coverage_post_ordine",
+                     "flag_over_180",
                      "categoria_regola",
                      "motivo_scarto"]
     scartati_cols = [c for c in scartati_cols if c in scartati.columns]
